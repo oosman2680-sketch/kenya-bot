@@ -1,30 +1,33 @@
 'use strict';
 
-const { getDb } = require('./database');
+const { pool } = require('./database');
 
-function getBusinessBySlug(slug) {
-  const db = getDb();
-  return db.prepare('SELECT * FROM businesses WHERE slug = ?').get(slug);
+async function getBusinessBySlug(slug) {
+  const { rows } = await pool.query('SELECT * FROM businesses WHERE slug = $1', [slug]);
+  return rows[0] || null;
 }
 
-function getBusinessById(id) {
-  const db = getDb();
-  return db.prepare('SELECT * FROM businesses WHERE id = ?').get(id);
+async function getBusinessById(id) {
+  const { rows } = await pool.query('SELECT * FROM businesses WHERE id = $1', [id]);
+  return rows[0] || null;
 }
 
-function getServicesByBusiness(businessId) {
-  const db = getDb();
-  return db.prepare('SELECT * FROM services WHERE business_id = ?').all(businessId);
+async function getServicesByBusiness(businessId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM services WHERE business_id = $1 ORDER BY id',
+    [businessId]
+  );
+  return rows;
 }
 
-function getServiceById(serviceId) {
-  const db = getDb();
-  return db.prepare('SELECT * FROM services WHERE id = ?').get(serviceId);
+async function getServiceById(serviceId) {
+  const { rows } = await pool.query('SELECT * FROM services WHERE id = $1', [serviceId]);
+  return rows[0] || null;
 }
 
-function listBusinesses() {
-  const db = getDb();
-  return db.prepare('SELECT * FROM businesses ORDER BY name').all();
+async function listBusinesses() {
+  const { rows } = await pool.query('SELECT * FROM businesses ORDER BY name');
+  return rows;
 }
 
 module.exports = {

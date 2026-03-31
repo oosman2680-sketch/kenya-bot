@@ -12,20 +12,44 @@ function t(lang) {
   return lang === 'sw' ? sw : en;
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Input sanitization ──────────────────────────────────────────────────────
+
+/** Strip HTML characters and limit length. Returns null if too short. */
+function sanitizeName(input) {
+  const clean = (input || '').replace(/[<>&"'\\]/g, '').trim().slice(0, 100);
+  return clean.length >= 2 ? clean : null;
+}
+
+/** Validate a phone number — strips formatting, accepts 7–15 digit patterns. */
+function sanitizePhone(input) {
+  const clean = (input || '').replace(/[\s\-\(\)\.]/g, '');
+  if (!/^\+?\d{7,15}$/.test(clean)) return null;
+  return clean;
+}
+
+// ─── Date helpers ────────────────────────────────────────────────────────────
+
+/** Returns today as a Date object anchored to midnight in Africa/Nairobi. */
+function getTodayNairobi() {
+  const dateStr = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Nairobi',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date());
+  return new Date(dateStr + 'T00:00:00');
+}
 
 /**
  * Returns up to 7 upcoming non-Sunday days as selectable date options.
+ * Dates are computed in Africa/Nairobi timezone.
  */
 function buildDateOptions() {
-  const DAYS  = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const DAYS   = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const today  = getTodayNairobi();
 
   const options = [];
-  const cursor = new Date(today);
-  let offset = 0;
+  const cursor  = new Date(today);
+  let offset    = 0;
 
   while (options.length < 7 && offset < 14) {
     const dow = cursor.getDay();
@@ -46,7 +70,7 @@ function buildDateOptions() {
 }
 
 /**
- * Reduces a 30-min slot list to one slot per hour (every other entry),
+ * Reduces a slot list to one slot per hour (every other entry),
  * capped at 9 slots so the time menu stays compact.
  */
 function condenseSlots(slots) {
@@ -60,24 +84,38 @@ async function handleBookingFlow(phone, userInput, session, business) {
   const i18n  = t(lang);
   const step  = session.step || 'ask_name';
   const input = (userInput || '').trim();
+  const data  = session.data || {};
 
   // ── Step: ask name ──────────────────────────────────────────────────────
   if (step === 'ask_name') {
-    setSession(phone, { step: 'ask_phone', data: { ...session.data, name: input } });
+    const name = sanitizeName(input);
+    if (!name) {
+      const msg = lang === 'sw'
+        ? '⚠️ Tafadhali ingiza jina halali (herufi 2 au zaidi).'
+        : '⚠️ Please enter a valid name (at least 2 characters).';
+      return msg;
+    }
+    await setSession(phone, { step: 'ask_phone', data: { ...data, name } });
     return i18n.askPhone;
   }
 
   // ── Step: ask phone ─────────────────────────────────────────────────────
   if (step === 'ask_phone') {
-    const customerPhone = input.replace(/\s+/g, '');
-    const services      = getServicesByBusiness(business.id);
-    setSession(phone, { step: 'ask_service', data: { ...session.data, customerPhone } });
+    const customerPhone = sanitizePhone(input);
+    if (!customerPhone) {
+      const msg = lang === 'sw'
+        ? '⚠️ Nambari ya simu si sahihi. Jaribu tena (mfano 0712345678).'
+        : '⚠️ Invalid phone number. Please try again (e.g. 0712345678).';
+      return msg;
+    }
+    const services = await getServicesByBusiness(business.id);
+    await setSession(phone, { step: 'ask_service', data: { ...data, customerPhone } });
     return i18n.askService(services);
   }
 
   // ── Step: ask service ───────────────────────────────────────────────────
   if (step === 'ask_service') {
-    const services = getServicesByBusiness(business.id);
+    const services = await getServicesByBusiness(business.id);
     const idx      = parseInt(input, 10) - 1;
     if (isNaN(idx) || idx < 0 || idx >= services.length) {
       return i18n.invalidOption + '\n\n' + i18n.askService(services);
@@ -85,10 +123,10 @@ async function handleBookingFlow(phone, userInput, session, business) {
     const chosen      = services[idx];
     const dateOptions = buildDateOptions();
 
-    setSession(phone, {
+    await setSession(phone, {
       step: 'ask_date',
       data: {
-        ...session.data,
+        ...data,
         serviceId:    chosen.id,
         serviceName:  chosen.name,
         servicePrice: chosen.price,
@@ -100,60 +138,58 @@ async function handleBookingFlow(phone, userInput, session, business) {
 
   // ── Step: ask date ──────────────────────────────────────────────────────
   if (step === 'ask_date') {
-    const dateOptions = session.data.dateOptions || [];
+    const dateOptions = data.dateOptions || [];
     let parsed = null;
 
-    // Accept numbered choice first
     const idx = parseInt(input, 10) - 1;
     if (!isNaN(idx) && idx >= 0 && idx < dateOptions.length) {
       parsed = dateOptions[idx].date;
     } else {
-      // Fall back to natural language / ISO parsing
-      parsed = parseDate(input) || session.data.dateFromNlp || null;
+      parsed = parseDate(input) || data.dateFromNlp || null;
     }
 
     if (!parsed) {
       return i18n.invalidDate + '\n\n' + i18n.askDateOptions(dateOptions);
     }
 
-    // Reject past dates
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    if (new Date(parsed) < today) {
+    // Reject past dates (compared in EAT)
+    const todayNairobi = getTodayNairobi();
+    if (new Date(parsed + 'T00:00:00') < todayNairobi) {
       const pastMsg = lang === 'sw' ? '⚠️ Tarehe hiyo imepita.' : '⚠️ That date is in the past.';
       return pastMsg + '\n\n' + i18n.askDateOptions(dateOptions);
     }
 
     const sectorConfig = getSectorConfig(business.sector);
     const allSlots     = sectorConfig.getAvailableSlots(parsed);
-    const available    = allSlots.filter((s) => !isSlotTaken(business.id, parsed, s));
+    const takenChecks  = await Promise.all(allSlots.map(s => isSlotTaken(business.id, parsed, s)));
+    const available    = allSlots.filter((_, i) => !takenChecks[i]);
 
     if (!available.length) return i18n.noSlotsAvailable;
 
     const displaySlots = condenseSlots(available);
 
-    setSession(phone, {
+    await setSession(phone, {
       step: 'ask_time',
-      data: { ...session.data, date: parsed, availableSlots: displaySlots },
+      data: { ...data, date: parsed, availableSlots: displaySlots },
     });
     return i18n.askTime(displaySlots, parsed);
   }
 
   // ── Step: ask time ──────────────────────────────────────────────────────
   if (step === 'ask_time') {
-    const slots = session.data.availableSlots || [];
+    const slots = data.availableSlots || [];
     const idx   = parseInt(input, 10) - 1;
     if (isNaN(idx) || idx < 0 || idx >= slots.length) {
-      return i18n.invalidOption + '\n\n' + i18n.askTime(slots, session.data.date);
+      return i18n.invalidOption + '\n\n' + i18n.askTime(slots, data.date);
     }
     const chosenTime = slots[idx];
-    setSession(phone, { step: 'confirm', data: { ...session.data, time: chosenTime } });
+    await setSession(phone, { step: 'confirm', data: { ...data, time: chosenTime } });
     return i18n.confirmBooking({
-      name:    session.data.name,
-      service: session.data.serviceName,
-      date:    session.data.date,
+      name:    data.name,
+      service: data.serviceName,
+      date:    data.date,
       time:    chosenTime,
-      price:   session.data.servicePrice,
+      price:   data.servicePrice,
     });
   }
 
@@ -161,16 +197,16 @@ async function handleBookingFlow(phone, userInput, session, business) {
   if (step === 'confirm') {
     const upper = input.toUpperCase();
     if (['YES', 'NDIO', 'Y', '1', '✅'].includes(upper)) {
-      const d = session.data;
+      const d = data;
 
-      if (isSlotTaken(business.id, d.date, d.time)) {
+      if (await isSlotTaken(business.id, d.date, d.time)) {
         const takenMsg = lang === 'sw' ? '⚠️ Muda huo umechukuliwa.' : '⚠️ That slot was just taken.';
         const dateOptions = buildDateOptions();
-        setSession(phone, { step: 'ask_date', data: { ...d, dateOptions } });
+        await setSession(phone, { step: 'ask_date', data: { ...d, dateOptions } });
         return takenMsg + '\n\n' + i18n.askDateOptions(dateOptions);
       }
 
-      const { ref } = createAppointment({
+      const { ref } = await createAppointment({
         businessId:    business.id,
         customerName:  d.name,
         customerPhone: d.customerPhone,
@@ -180,11 +216,11 @@ async function handleBookingFlow(phone, userInput, session, business) {
         time:          d.time,
       });
 
-      clearSession(phone);
+      await clearSession(phone);
       return i18n.bookingConfirmed(ref);
 
     } else if (['NO', 'HAPANA', 'N', '0', 'CANCEL', 'FUTA'].includes(upper)) {
-      clearSession(phone);
+      await clearSession(phone);
       return i18n.bookingCancelled;
     } else {
       return lang === 'sw'

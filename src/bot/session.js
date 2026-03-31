@@ -1,57 +1,66 @@
 'use strict';
 
 /**
- * In-memory session store keyed by user phone number.
- * Each session tracks the current conversation flow state.
- *
- * Shape:
- * {
- *   step: string,          // current step in the flow
- *   bizId: number,         // active business
- *   bizSlug: string,
- *   lang: string,          // 'en' | 'sw'
- *   data: object,          // accumulated booking data
- *   lastActive: number,    // timestamp for TTL cleanup
- * }
+ * PostgreSQL-backed session store.
+ * Sessions are stored as JSONB in the `sessions` table, keyed by phone number.
+ * TTL: 30 minutes of inactivity. The `||` JSONB merge operator performs a
+ * shallow merge identical to the previous in-memory { ...existing, ...updates }.
  */
 
-const sessions = new Map();
+const { pool } = require('../db/database');
+
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
-function getSession(phone) {
-  const session = sessions.get(phone);
-  if (!session) return null;
+async function getSession(phone) {
+  try {
+    const { rows } = await pool.query(
+      'SELECT data, last_active FROM sessions WHERE phone = $1',
+      [phone]
+    );
+    if (!rows.length) return null;
 
-  // Expire stale sessions
-  if (Date.now() - session.lastActive > SESSION_TTL_MS) {
-    sessions.delete(phone);
+    const age = Date.now() - new Date(rows[0].last_active).getTime();
+    if (age > SESSION_TTL_MS) {
+      await pool.query('DELETE FROM sessions WHERE phone = $1', [phone]);
+      return null;
+    }
+
+    return rows[0].data;
+  } catch (err) {
+    console.error('[Session] getSession error:', err.message);
     return null;
   }
-
-  session.lastActive = Date.now();
-  return session;
 }
 
-function setSession(phone, data) {
-  const existing = sessions.get(phone) || {};
-  sessions.set(phone, {
-    ...existing,
-    ...data,
-    lastActive: Date.now(),
-  });
+async function setSession(phone, updates) {
+  try {
+    await pool.query(
+      `INSERT INTO sessions (phone, data, last_active)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (phone) DO UPDATE
+         SET data        = sessions.data || $2::jsonb,
+             last_active = NOW()`,
+      [phone, JSON.stringify(updates)]
+    );
+  } catch (err) {
+    console.error('[Session] setSession error:', err.message);
+  }
 }
 
-function clearSession(phone) {
-  sessions.delete(phone);
+async function clearSession(phone) {
+  try {
+    await pool.query('DELETE FROM sessions WHERE phone = $1', [phone]);
+  } catch (err) {
+    console.error('[Session] clearSession error:', err.message);
+  }
 }
 
-// Periodic cleanup of expired sessions (every 10 min)
-setInterval(() => {
-  const now = Date.now();
-  for (const [phone, session] of sessions.entries()) {
-    if (now - session.lastActive > SESSION_TTL_MS) {
-      sessions.delete(phone);
-    }
+// Periodic DB-side cleanup of expired sessions every 10 minutes
+setInterval(async () => {
+  try {
+    await pool.query(`DELETE FROM sessions WHERE last_active < NOW() - INTERVAL '30 minutes'`);
+  } catch (err) {
+    console.error('[Session] Cleanup error:', err.message);
   }
 }, 10 * 60 * 1000);
 

@@ -8,11 +8,11 @@ const MODEL = 'llama-3.3-70b-versatile';
 
 // Keyword-based intent map — avoids API calls for common inputs
 const KEYWORD_INTENTS = {
-  greeting: ['hi', 'hello', 'hey', 'hola', 'habari', 'hujambo', 'mambo', 'niaje', 'sasa', 'menu', 'start'],
-  book:     ['book', 'booking', 'appointment', 'reserve', 'schedule', 'weka', 'panga', 'nafasi'],
+  greeting:      ['hi', 'hello', 'hey', 'hola', 'habari', 'hujambo', 'mambo', 'niaje', 'sasa', 'menu', 'start'],
+  book:          ['book', 'booking', 'appointment', 'reserve', 'schedule', 'weka', 'panga', 'nafasi'],
   view_bookings: ['my bookings', 'my appointments', 'view', 'check', 'status', 'angalia', 'ona'],
-  cancel:   ['cancel', 'cancellation', 'futa', 'acha'],
-  contact:  ['contact', 'address', 'location', 'phone', 'number', 'hours', 'anwani', 'simu', 'mahali'],
+  cancel:        ['cancel', 'cancellation', 'futa', 'acha'],
+  contact:       ['contact', 'address', 'location', 'phone', 'number', 'hours', 'anwani', 'simu', 'mahali'],
 };
 
 function detectIntentByKeyword(input, lang) {
@@ -25,6 +25,14 @@ function detectIntentByKeyword(input, lang) {
   return null;
 }
 
+/** Returns today's date string (YYYY-MM-DD) in Africa/Nairobi timezone (EAT, UTC+3). */
+function getTodayNairobi() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Nairobi',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date());
+}
+
 /**
  * Detect user intent and normalize date/free-text using Groq.
  * Returns a structured JSON object.
@@ -34,16 +42,17 @@ async function detectIntent(userMessage, lang = 'en') {
   const quick = detectIntentByKeyword(userMessage, lang);
   if (quick) return quick;
 
+  const todayNairobi = getTodayNairobi();
   const prompt = `You are a WhatsApp booking assistant for small businesses in Kenya.
 User language: ${lang === 'sw' ? 'Swahili' : 'English'}.
 
 Analyze this message and return ONLY valid JSON (no markdown, no explanation):
-Message: "${userMessage}"
+Message: "${userMessage.replace(/"/g, '\\"')}"
 
 Return JSON with:
 {
   "intent": one of ["book", "view_bookings", "cancel", "contact", "menu", "confirm", "deny", "greeting", "unknown"],
-  "date": normalized date as "YYYY-MM-DD" if mentioned (today=${new Date().toISOString().slice(0, 10)}), else null,
+  "date": normalized date as "YYYY-MM-DD" if mentioned (today=${todayNairobi}), else null,
   "ref_code": booking reference like "KE-XXXXX" if mentioned, else null,
   "lang": "en" or "sw" based on the message language,
   "confidence": number 0-1
@@ -77,7 +86,7 @@ async function generateSmartReply(userMessage, bizName, lang = 'en') {
 
   const prompt = `You are a helpful WhatsApp booking assistant for "${bizName}" in Kenya.
 ${langInstruction}
-The user said: "${userMessage}"
+The user said: "${userMessage.replace(/"/g, '\\"')}"
 Give a concise, helpful reply (max 3 sentences). Do NOT mention you are AI.`;
 
   try {
@@ -98,16 +107,17 @@ Give a concise, helpful reply (max 3 sentences). Do NOT mention you are AI.`;
 
 /**
  * Normalize a date string or relative word to YYYY-MM-DD.
+ * All "today/tomorrow" calculations use Africa/Nairobi timezone.
  */
 function parseDate(input) {
   if (!input) return null;
   const lower = input.toLowerCase().trim();
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const todayStr = getTodayNairobi();
+  const today = new Date(todayStr + 'T00:00:00');
 
   if (['today', 'leo'].includes(lower)) {
-    return today.toISOString().slice(0, 10);
+    return todayStr;
   }
   if (['tomorrow', 'kesho'].includes(lower)) {
     const d = new Date(today);
