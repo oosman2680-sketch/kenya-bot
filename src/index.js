@@ -115,7 +115,15 @@ process.on('uncaughtException', (err) => {
 });
 
 // ── Startup ───────────────────────────────────────────────────────────────────
+const REQUIRED_ENV = ['DATABASE_URL', 'ANTHROPIC_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'];
+
 async function main() {
+  const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+  if (missing.length) {
+    console.error(`[Startup] Missing required environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+
   try {
     await initDb();
 
