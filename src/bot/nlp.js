@@ -1,10 +1,10 @@
 'use strict';
 
 require('dotenv').config();
-const Groq = require('groq-sdk');
+const Anthropic = require('@anthropic-ai/sdk');
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const MODEL = 'llama-3.3-70b-versatile';
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const MODEL = 'claude-haiku-4-5';
 
 // Keyword-based intent map — avoids API calls for common inputs
 const KEYWORD_INTENTS = {
@@ -59,17 +59,17 @@ Return JSON with:
 }`;
 
   try {
-    const completion = await groq.chat.completions.create({
+    const message = await client.messages.create({
       model: MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
       max_tokens: 200,
+      temperature: 0.1,
+      messages: [{ role: 'user', content: prompt }],
     });
-    const text = completion.choices[0].message.content.trim();
+    const text = message.content[0].text.trim();
     const clean = text.replace(/```json|```/g, '').trim();
     return JSON.parse(clean);
   } catch (err) {
-    console.error('[NLP] Groq error:', err.message);
+    console.error('[NLP] Claude error:', err.message);
     return { intent: 'unknown', date: null, ref_code: null, lang, confidence: 0 };
   }
 }
@@ -90,13 +90,13 @@ The user said: "${userMessage.replace(/"/g, '\\"')}"
 Give a concise, helpful reply (max 3 sentences). Do NOT mention you are AI.`;
 
   try {
-    const completion = await groq.chat.completions.create({
+    const message = await client.messages.create({
       model: MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
       max_tokens: 150,
+      temperature: 0.7,
+      messages: [{ role: 'user', content: prompt }],
     });
-    return completion.choices[0].message.content.trim();
+    return message.content[0].text.trim();
   } catch (err) {
     console.error('[NLP] Smart reply error:', err.message);
     return lang === 'sw'
