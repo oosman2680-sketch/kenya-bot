@@ -2,83 +2,84 @@
 
 require('dotenv').config();
 
-const express    = require('express');
-const rateLimit  = require('express-rate-limit');
-const twilio     = require('twilio');
-const { routeMessage }    = require('./bot/router');
-const { twimlReply }      = require('./messaging/twilio');
+const express   = require('express');
+const rateLimit = require('express-rate-limit');
+const { routeMessage }     = require('./bot/router');
+const { sendMessage }      = require('./messaging/whatsapp');
 const { startReminderJob } = require('./flows/reminder');
-const { pool, initDb }    = require('./db/database');
+const { pool, initDb }     = require('./db/database');
 
-const app = express();
+const app  = express();
+const PORT = process.env.PORT || 3000;
 
 // Trust Render's proxy so req.ip reflects the real client IP
 app.set('trust proxy', 1);
-
-app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
-const PORT = process.env.PORT || 3000;
-
-// ── Rate limiting: max 20 msgs/min per phone number ──────────────────────────
+// ── Rate limiting: max 60 msgs/min per IP ────────────────────────────────────
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
-  keyGenerator: (req) => req.body?.From || req.ip,
+  max: 60,
+  keyGenerator: (req) => req.ip,
   handler: (req, res) => {
-    console.warn(`[RateLimit] Blocked ${req.body?.From || req.ip}`);
-    res.type('text/xml').send(
-      twimlReply('Too many messages. Please wait a moment before trying again.')
-    );
+    console.warn(`[RateLimit] Blocked ${req.ip}`);
+    res.sendStatus(429);
   },
   standardHeaders: true,
   legacyHeaders:   false,
 });
 
-// ── Twilio webhook signature validation ──────────────────────────────────────
-function validateTwilioSignature(req, res, next) {
-  // Skip in development — set NODE_ENV=production on Render
-  if (process.env.NODE_ENV !== 'production') return next();
+// ── GET /webhook — Meta verification challenge ───────────────────────────────
+app.get('/webhook', (req, res) => {
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
 
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  if (!authToken) return next();
-
-  const signature = req.headers['x-twilio-signature'] || '';
-  const url       = `${process.env.BASE_URL}${req.originalUrl}`;
-
-  const isValid = twilio.validateRequest(authToken, signature, url, req.body || {});
-  if (!isValid) {
-    console.warn(`[Security] Invalid Twilio signature | IP: ${req.ip} | URL: ${url}`);
-    return res.status(403).type('text/plain').send('Forbidden');
-  }
-  next();
-}
-
-// ── Webhook ──────────────────────────────────────────────────────────────────
-app.post('/webhook', webhookLimiter, validateTwilioSignature, async (req, res) => {
-  const from    = req.body.From || '';
-  const body    = req.body.Body || '';
-  const bizSlug = req.query.biz || null;
-
-  // Hard cap on message length
-  if (body.length > 1000) {
-    return res.type('text/xml').send(
-      twimlReply('Message too long. Please send a shorter message.')
-    );
+  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+    console.log('[Webhook] Meta verification successful.');
+    return res.status(200).send(challenge);
   }
 
-  console.log(`[Webhook] From: ${from} | Biz: ${bizSlug || 'default'} | Msg: ${body.slice(0, 80)}`);
+  console.warn('[Webhook] Meta verification failed — token mismatch.');
+  res.sendStatus(403);
+});
+
+// ── POST /webhook — Incoming messages from Meta ──────────────────────────────
+app.post('/webhook', webhookLimiter, async (req, res) => {
+  // Always acknowledge immediately — Meta retries if it doesn't get 200 quickly
+  res.sendStatus(200);
+
+  const payload = req.body;
+  if (payload?.object !== 'whatsapp_business_account') return;
+
+  const message = payload.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
+  // Ignore non-text messages (images, audio, reactions, etc.)
+  if (!message || message.type !== 'text') return;
+
+  const from    = message.from;           // e.g. "254712345678" (no +)
+  const phone   = `+${from}`;            // normalize to "+254712345678" for session key
+  const text    = message.text?.body || '';
+  const bizSlug = req.query.biz || null; // e.g. /webhook?biz=glamour-salon
+
+  if (text.length > 1000) {
+    await sendMessage(from, 'Message too long. Please send a shorter message.').catch(() => {});
+    return;
+  }
+
+  console.log(`[Webhook] From: ${phone} | Biz: ${bizSlug || 'default'} | Msg: ${text.slice(0, 80)}`);
 
   try {
-    const reply = await routeMessage(from, body, bizSlug);
-    res.type('text/xml').send(twimlReply(reply));
+    const reply = await routeMessage(phone, text, bizSlug);
+    await sendMessage(from, reply);
   } catch (err) {
     console.error('[Webhook] Unhandled error:', err);
-    res.type('text/xml').send(twimlReply('Sorry, something went wrong. Please try again.'));
+    await sendMessage(from, 'Sorry, something went wrong. Please try again.').catch(() => {});
   }
 });
 
-// ── Health check (includes DB ping) ─────────────────────────────────────────
+// ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -88,7 +89,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// ── Admin: list businesses ───────────────────────────────────────────────────
+// ── Admin: list businesses ────────────────────────────────────────────────────
 app.get('/businesses', async (req, res) => {
   try {
     const { listBusinesses } = require('./db/businesses');
@@ -101,7 +102,7 @@ app.get('/businesses', async (req, res) => {
 // ── Global Express error handler ─────────────────────────────────────────────
 app.use((err, req, res, _next) => {
   console.error('[Express] Unhandled middleware error:', err);
-  res.type('text/xml').send(twimlReply('Sorry, something went wrong. Please try again.'));
+  res.sendStatus(500);
 });
 
 // ── Process-level safety nets ────────────────────────────────────────────────
@@ -111,12 +112,18 @@ process.on('unhandledRejection', (reason) => {
 
 process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught exception:', err);
-  // Log but keep serving — Render will restart on fatal crashes
 });
 
-// ── Startup ───────────────────────────────────────────────────────────────────
-const REQUIRED_ENV = ['DATABASE_URL', 'ANTHROPIC_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'];
+// ── Required env vars ─────────────────────────────────────────────────────────
+const REQUIRED_ENV = [
+  'DATABASE_URL',
+  'ANTHROPIC_API_KEY',
+  'WHATSAPP_VERIFY_TOKEN',
+  'WHATSAPP_PHONE_NUMBER_ID',
+  'WHATSAPP_ACCESS_TOKEN',
+];
 
+// ── Startup ───────────────────────────────────────────────────────────────────
 async function main() {
   const missing = REQUIRED_ENV.filter(k => !process.env[k]);
   if (missing.length) {
@@ -138,7 +145,7 @@ async function main() {
       startReminderJob();
     });
 
-    // ── Graceful shutdown (SIGTERM from Render, SIGINT from Ctrl-C) ──────────
+    // ── Graceful shutdown ────────────────────────────────────────────────────
     async function gracefulShutdown(signal) {
       console.log(`\n[Shutdown] ${signal} received — shutting down gracefully...`);
       server.close(async () => {
@@ -152,7 +159,6 @@ async function main() {
         process.exit(0);
       });
 
-      // Force exit after 10 s to avoid hanging
       setTimeout(() => {
         console.error('[Shutdown] Forced exit after 10 s timeout.');
         process.exit(1);

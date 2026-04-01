@@ -2,7 +2,7 @@
 
 const cron = require('node-cron');
 const { getAppointmentsDueForReminder, markReminderSent } = require('../db/appointments');
-const { sendMessage } = require('../messaging/twilio');
+const { sendMessage } = require('../messaging/whatsapp');
 const en = require('../i18n/en');
 const sw = require('../i18n/sw');
 
@@ -34,9 +34,7 @@ function startReminderJob() {
             time:    appt.appointment_time,
           });
 
-          const to = appt.customer_phone.startsWith('whatsapp:')
-            ? appt.customer_phone
-            : `whatsapp:${appt.customer_phone}`;
+          const to = appt.customer_phone;
 
           await sendMessage(to, message);
           await markReminderSent(appt.id);
