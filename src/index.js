@@ -4,10 +4,12 @@ require('dotenv').config();
 
 const express   = require('express');
 const rateLimit = require('express-rate-limit');
-const { routeMessage }     = require('./bot/router');
-const { sendMessage }      = require('./messaging/whatsapp');
-const { startReminderJob } = require('./flows/reminder');
-const { pool, initDb }     = require('./db/database');
+const { routeMessage }         = require('./bot/router');
+const { sendMessage, sendButtons, sendList } = require('./messaging/whatsapp');
+const { startReminderJob }     = require('./flows/reminder');
+const { startDailyReportJob }  = require('./bot/report');
+const { startRatingJob }       = require('./bot/ratings');
+const { pool, initDb }         = require('./db/database');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -71,8 +73,24 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
   console.log(`[Webhook] From: ${phone} | Biz: ${bizSlug || 'default'} | Msg: ${text.slice(0, 80)}`);
 
   try {
-    const reply = await routeMessage(phone, text, bizSlug);
-    await sendMessage(from, reply);
+    const result  = await routeMessage(phone, text, bizSlug);
+    const replyText = result?.text ?? (typeof result === 'string' ? result : '');
+    const options   = result?.options ?? [];
+    const isHandoff = result?.isHandoff ?? false;
+
+    if (isHandoff) {
+      await sendMessage(from, replyText + '\n\n👥 Connecting you to our team shortly...');
+    } else if (options.length >= 2 && options.length <= 3) {
+      await sendButtons(from, replyText, options);
+    } else if (options.length > 3) {
+      const section = {
+        title: 'Choose an option',
+        rows:  options.map((o, i) => ({ id: `opt_${i}`, title: o.slice(0, 24) })),
+      };
+      await sendList(from, replyText, 'See options', [section]);
+    } else {
+      await sendMessage(from, replyText);
+    }
   } catch (err) {
     console.error('[Webhook] Unhandled error:', err);
     await sendMessage(from, 'Sorry, something went wrong. Please try again.').catch(() => {});
@@ -143,6 +161,8 @@ async function main() {
       console.log(`Webhook URL: ${base}/webhook`);
       console.log(`Multi-biz:   ${base}/webhook?biz=<slug>\n`);
       startReminderJob();
+      startDailyReportJob();
+      startRatingJob();
     });
 
     // ── Graceful shutdown ────────────────────────────────────────────────────
